@@ -29,6 +29,9 @@ __all__ = [
     'TrainableWrapper',
     'DistributedVariableWrapper',
     'DynamicEmbeddingOptimizer',
+    'is_ps_strategy',
+    'apply_ps_de_update',
+    'fit_ps',
     'GraphKeys',
     'ModelMode',
     'RestrictPolicy',
@@ -92,6 +95,12 @@ from tensorflow_recommenders_addons.dynamic_embedding.python.ops.dynamic_embeddi
     create_slots,)
 from tensorflow_recommenders_addons.dynamic_embedding.python.ops.dynamic_embedding_optimizer import (
     DynamicEmbeddingOptimizer,)
+from tensorflow_recommenders_addons.dynamic_embedding.python.ops.ps_embedding_optimizer import (
+    is_ps_strategy,
+    apply_ps_de_update,
+)
+from tensorflow_recommenders_addons.dynamic_embedding.python.keras.models import (
+    fit_ps,)
 from tensorflow_recommenders_addons.dynamic_embedding.python.ops.dynamic_embedding_variable import (
     get_variable,
     embedding_lookup,

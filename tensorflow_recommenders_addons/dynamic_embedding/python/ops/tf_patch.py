@@ -251,8 +251,11 @@ def device_function(self, op):
   #  a less bad way of avoiding handle of `TrainableWrapper` be
   #  placed on the PS devices for node_def carries too little information to
   #  know if it was created by `TrainableWrapper` or not.
-  if ("TrainableWrapper" not in node_def.name and self._ps_tasks
-      and self._ps_device and node_def.op in self._ps_ops):
+  _is_de_related = ("TrainableWrapper" in node_def.name
+                    or "ShadowVariable" in node_def.name
+                    or "DynamicEmbedding" in node_def.name)
+  if (not _is_de_related and self._ps_tasks and self._ps_device
+      and node_def.op in self._ps_ops):
     ps_device = pydev.DeviceSpec.from_string(self._ps_device)
 
     current_job, ps_job = current_device.job, ps_device.job

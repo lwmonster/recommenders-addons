@@ -59,11 +59,17 @@ class DualChannelsDeepModel(tf.keras.Model):
         user_embedding_size,
         initializer=embedding_initializer,
         devices=self.devices,
+        with_unique=True,
+        bp_v2=True,
+        input_key='user_id',
         name='user_embedding')
     self.movie_embedding = de.keras.layers.SquashedEmbedding(
         movie_embedding_size,
         initializer=embedding_initializer,
         devices=self.devices,
+        with_unique=True,
+        bp_v2=True,
+        input_key='movie_id',
         name='movie_embedding')
 
     self.dnn1 = tf.keras.layers.Dense(
@@ -103,6 +109,17 @@ class DualChannelsDeepModel(tf.keras.Model):
     x = 0.2 * x + 0.8 * bias
     return x
 
+  def call_with_embeddings(self, features, embeddings, training=None):
+    user_latent = embeddings['user_embedding']
+    movie_latent = embeddings['movie_embedding']
+    latent = tf.concat([user_latent, movie_latent], axis=1)
+    x = self.dnn1(latent)
+    x = self.dnn2(x)
+    x = self.dnn3(x)
+    bias = self.bias_net(latent)
+    x = 0.2 * x + 0.8 * bias
+    return x
+
 
 class Runner():
 
@@ -111,6 +128,11 @@ class Runner():
     self.strategy = strategy
     self.num_worker = strategy._num_workers
     self.num_ps = strategy._num_ps
+    self.ps_devices = [
+        "/job:ps/replica:0/task:{}/device:CPU:0".format(idx)
+        for idx in range(self.num_ps)
+    ]
+    # Use all PS nodes as DE shards
     self.ps_devices = [
         "/job:ps/replica:0/task:{}/device:CPU:0".format(idx)
         for idx in range(self.num_ps)
@@ -139,8 +161,12 @@ class Runner():
     return dataset
 
   def train(self):
-    dataset = self.get_dataset(batch_size=self.train_bs)
-    dataset = self.strategy.experimental_distribute_dataset(dataset)
+    train_bs = self.train_bs
+    get_dataset = self.get_dataset
+
+    def dataset_fn():
+      return get_dataset(batch_size=train_bs)
+
     with self.strategy.scope():
       model = DualChannelsDeepModel(
           self.ps_devices, self.embedding_size, self.embedding_size,
@@ -160,7 +186,11 @@ class Runner():
       if os.path.exists(self.model_dir):
         model.load_weights(self.model_dir)
 
-    model.fit(dataset, epochs=self.epochs, steps_per_epoch=self.steps_per_epoch)
+    de.fit_ps(model,
+              dataset_fn,
+              self.strategy,
+              epochs=self.epochs,
+              steps_per_epoch=self.steps_per_epoch)
 
     if self.model_dir:
       save_options = tf.saved_model.SaveOptions(namespace_whitelist=['TFRA'])
@@ -242,8 +272,8 @@ def start_chief(config):
   runner = Runner(strategy=strategy,
                   train_bs=64,
                   test_bs=1,
-                  epochs=2,
-                  steps_per_epoch=10,
+                  epochs=10,
+                  steps_per_epoch=100,
                   model_dir=None,
                   export_dir=None)
   runner.train()
@@ -261,6 +291,52 @@ def start_worker(task_id, config):
                                 protocol='grpc',
                                 job_name="worker",
                                 task_index=task_id)
+
+  import threading
+  import subprocess
+  import time as _time
+  import os as _os
+
+  def _monitor_worker_connections():
+    _time.sleep(3)
+    pid = _os.getpid()
+    ps_ports = [addr.split(":")[-1] for addr in config["cluster"]["ps"]]
+    print(
+        f"[Worker-{task_id} PID={pid}] Network monitor started, watching PS ports: {ps_ports}",
+        flush=True)
+
+    for i in range(60):
+      _time.sleep(2)
+      try:
+        conns = subprocess.check_output(
+            f"ss -tnp 2>/dev/null | grep 'pid={pid}'",
+            shell=True,
+            text=True,
+            timeout=3)
+        ps_conns = []
+        for line in conns.strip().split('\n'):
+          for port in ps_ports:
+            if f":{port}" in line and 'ESTAB' in line:
+              ps_conns.append(line.strip())
+        if ps_conns:
+          print(
+              f"[Worker-{task_id}] t={2*(i+1):3d}s: {len(ps_conns)} TCP connections to PS:",
+              flush=True)
+          for c in ps_conns:
+            parts = c.split()
+            local = parts[3] if len(parts) > 3 else "?"
+            remote = parts[4] if len(parts) > 4 else "?"
+            print(f"[Worker-{task_id}]   {local} -> {remote}", flush=True)
+        else:
+          if i % 5 == 0:
+            print(f"[Worker-{task_id}] t={2*(i+1):3d}s: no PS connections yet",
+                  flush=True)
+      except Exception:
+        pass
+
+  t = threading.Thread(target=_monitor_worker_connections, daemon=True)
+  t.start()
+
   server.join()
 
 
@@ -276,6 +352,45 @@ def start_ps(task_id, config):
                                 protocol='grpc',
                                 job_name="ps",
                                 task_index=task_id)
+
+  # === PS 进程内部: 监控本地网络流量和内存变化 ===
+  import threading
+  import time as _time
+  import os as _os
+
+  def _monitor_ps():
+    """PS 进程自己监控内存，证明有数据写入"""
+    _time.sleep(2)  # 短暂等待 server 完全启动
+    pid = _os.getpid()
+    print(
+        f"[PS-{task_id} PID={pid}] === Monitor started (sampling every 2s) ===",
+        flush=True)
+
+    def get_rss():
+      try:
+        with open(f'/proc/{pid}/status') as f:
+          for line in f:
+            if line.startswith('VmRSS:'):
+              return int(line.split()[1])
+      except Exception:
+        return 0
+
+    init_rss = get_rss()
+    print(
+        f"[PS-{task_id}] t=  0s: RSS={init_rss}KB (baseline, before training)",
+        flush=True)
+
+    for i in range(60):
+      _time.sleep(2)
+      rss = get_rss()
+      delta = rss - init_rss
+      if delta != 0 or i < 3 or i % 5 == 0:
+        print(f"[PS-{task_id}] t={2*(i+1):3d}s: RSS={rss}KB (Δ={delta:+d}KB)",
+              flush=True)
+
+  monitor = threading.Thread(target=_monitor_ps, daemon=True)
+  monitor.start()
+
   server.join()
 
 

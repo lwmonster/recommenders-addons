@@ -20,6 +20,8 @@ from packaging import version
 import six
 
 from tensorflow_recommenders_addons import dynamic_embedding as de
+from tensorflow_recommenders_addons.dynamic_embedding.python.ops.ps_embedding_optimizer import is_ps_strategy
+from tensorflow_recommenders_addons.dynamic_embedding.python.ops.ps_embedding_optimizer import apply_ps_de_update
 
 from tensorflow import version as tf_version
 from tensorflow.python.distribute import central_storage_strategy
@@ -161,6 +163,41 @@ def DynamicEmbeddingOptimizer(self, bp_v2=False, synchronous=False, **kwargs):
       else:
         if not var.params.trainable:
           return control_flow_ops.no_op()
+
+        # PS mode: bypass native optimizer ops, use hash table ops directly
+        if is_ps_strategy():
+          with ops.colocate_with(None, ignore_existing=True):
+            _slots = [self.get_slot(var, _s) for _s in self.get_slot_names()]
+            var._track_optimizer_slots(_slots)
+
+            # Collect slot de.Variable instances
+            slot_de_vars = {}
+            slot_names = self.get_slot_names()
+            for si, _s in enumerate(_slots):
+              if hasattr(_s, 'params') and isinstance(_s.params, de.Variable):
+                slot_de_vars[slot_names[si]] = _s.params
+
+            # If gradient is dense (after PS reduce), convert to
+            # IndexedSlices using the var's active ids
+            ps_grad = grad
+            if not isinstance(grad, IndexedSlices):
+              ids = var.ids if hasattr(var, 'ids') else None
+              if ids is not None:
+                ps_grad = IndexedSlices(
+                    values=grad,
+                    indices=ids,
+                    dense_shape=None,
+                )
+              else:
+                return control_flow_ops.no_op()
+
+            return apply_ps_de_update(
+                optimizer=self,
+                de_var=var.params,
+                grad=ps_grad,
+                slot_de_vars=slot_de_vars,
+                bp_v2=var.params.bp_v2,
+            )
 
         with ops.colocate_with(None, ignore_existing=True):
           _slots = [self.get_slot(var, _s) for _s in self.get_slot_names()]
@@ -319,6 +356,49 @@ def DynamicEmbeddingOptimizer(self, bp_v2=False, synchronous=False, **kwargs):
       else:
         if not var.params.trainable:
           return control_flow_ops.no_op()
+
+        # PS mode: bypass native optimizer ops, use hash table ops directly
+        if is_ps_strategy():
+          with ops.colocate_with(None, ignore_existing=True):
+            _slots = [
+                _s for _s in self._variables
+                if isinstance(_s, de.TrainableWrapper)
+            ]
+            var._track_optimizer_slots(_slots)
+
+            # Collect slot de.Variable instances
+            slot_de_vars = {}
+            for _s in _slots:
+              if hasattr(_s, 'params') and isinstance(_s.params, de.Variable):
+                # Derive slot name from the de.Variable name
+                slot_full_name = _s.params.name
+                var_name = var.params.name
+                slot_name_part = slot_full_name.replace(var_name + "/", "")
+                # Extract the last component as slot name
+                slot_name = slot_name_part.split("/")[-1]
+                slot_de_vars[slot_name] = _s.params
+
+            # If gradient is dense (after PS reduce), convert to
+            # IndexedSlices using the var's active ids
+            ps_grad = grad
+            if not isinstance(grad, IndexedSlices):
+              ids = var.ids if hasattr(var, 'ids') else None
+              if ids is not None:
+                ps_grad = IndexedSlices(
+                    values=grad,
+                    indices=ids,
+                    dense_shape=None,
+                )
+              else:
+                return control_flow_ops.no_op()
+
+            return apply_ps_de_update(
+                optimizer=self,
+                de_var=var.params,
+                grad=ps_grad,
+                slot_de_vars=slot_de_vars,
+                bp_v2=var.params.bp_v2,
+            )
 
         with ops.colocate_with(None, ignore_existing=True):
           _slots = [
@@ -730,9 +810,10 @@ def DynamicEmbeddingOptimizer(self, bp_v2=False, synchronous=False, **kwargs):
                      parameter_server_strategy_v2.ParameterServerStrategyV2,
                      central_storage_strategy.CentralStorageStrategy,
                      central_storage_strategy.CentralStorageStrategyV1))):
-        raise NotImplementedError(
-            "`experimental_aggregate_gradients=False is not supported for "
-            "ParameterServerStrategy and CentralStorageStrategy")
+        if not is_ps_strategy(strategy):
+          raise NotImplementedError(
+              "`experimental_aggregate_gradients=False is not supported for "
+              "CentralStorageStrategy")
 
       apply_state = self._prepare(var_list)
       if experimental_aggregate_gradients:

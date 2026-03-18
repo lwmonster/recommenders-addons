@@ -144,6 +144,7 @@ class Embedding(Layer):
                name='DynamicEmbeddingLayer',
                with_unique=True,
                short_file_name=False,
+               input_key=None,
                **kwargs):
     """
     Creates an Embedding layer.
@@ -194,6 +195,7 @@ class Embedding(Layer):
 
     self.embedding_size = embedding_size
     self.combiner = combiner
+    self.input_key = input_key
     if initializer is None:
       initializer = RandomNormal()
     partitioner = kwargs.get('partitioner', devar.default_partition_fn)
