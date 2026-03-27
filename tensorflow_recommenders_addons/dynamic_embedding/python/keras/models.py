@@ -189,6 +189,67 @@ def de_save_model(model,
                       **kwargs)
 
 
+def _extract_ids_and_segments(ids):
+  """Extract flat IDs and segment info from Dense, SparseTensor, or RaggedTensor.
+
+  Args:
+    ids: A Dense Tensor, tf.sparse.SparseTensor, or tf.RaggedTensor of feature
+      IDs.
+
+  Returns:
+    A tuple (flat_ids, segment_ids, num_segments, is_sparse) where:
+      - flat_ids: 1D Tensor of all IDs (for hash table lookup).
+      - segment_ids: 1D int Tensor mapping each flat_id to its sample index,
+          or None if ids is dense.
+      - num_segments: Scalar int Tensor with the number of samples (batch size),
+          or None if ids is dense.
+      - is_sparse: Python bool indicating whether segment aggregation is needed.
+  """
+  import tensorflow as tf
+  if isinstance(ids, tf.sparse.SparseTensor):
+    flat_ids = ids.values
+    segment_ids = tf.cast(ids.indices[:, 0], tf.int32)
+    num_segments = tf.cast(ids.dense_shape[0], tf.int32)
+    return flat_ids, segment_ids, num_segments, True
+  elif isinstance(ids, tf.RaggedTensor):
+    flat_ids = ids.flat_values
+    segment_ids = tf.cast(ids.value_rowids(), tf.int32)
+    num_segments = tf.cast(ids.nrows(), tf.int32)
+    return flat_ids, segment_ids, num_segments, True
+  else:
+    flat_ids = tf.reshape(ids, [-1])
+    return flat_ids, None, None, False
+
+
+def _segment_combine(embeddings, segment_ids, num_segments, combiner='sum'):
+  """Aggregate embeddings per segment using the specified combiner.
+
+  Args:
+    embeddings: 2D Tensor of shape [num_flat_ids, embedding_size].
+    segment_ids: 1D int Tensor mapping each embedding to a segment.
+    num_segments: Scalar int Tensor with total number of segments.
+    combiner: One of 'sum', 'mean', 'sqrtn'.
+
+  Returns:
+    Aggregated embeddings of shape [num_segments, embedding_size].
+  """
+  import tensorflow as tf
+  if combiner == 'sum':
+    return tf.math.unsorted_segment_sum(embeddings, segment_ids, num_segments)
+  elif combiner == 'mean':
+    return tf.math.unsorted_segment_mean(embeddings, segment_ids, num_segments)
+  elif combiner == 'sqrtn':
+    summed = tf.math.unsorted_segment_sum(embeddings, segment_ids, num_segments)
+    ones = tf.ones_like(segment_ids, dtype=embeddings.dtype)
+    lengths = tf.math.unsorted_segment_sum(ones, segment_ids, num_segments)
+    lengths = tf.maximum(lengths, 1.0)
+    return summed / tf.expand_dims(tf.sqrt(lengths), 1)
+  else:
+    raise ValueError(
+        "Unsupported combiner '{}'. Must be 'sum', 'mean', or 'sqrtn'.".format(
+            combiner))
+
+
 def fit_ps(model,
            dataset_fn,
            strategy,
@@ -293,7 +354,8 @@ def fit_ps(model,
         for layer_name, shadow in shadow_group.items():
           layer = model.get_layer(layer_name)
           ids = x[layer.input_key]
-          ids_flat = tf.reshape(ids, [-1])
+          ids_flat, segment_ids, num_segments, is_sparse = (
+              _extract_ids_and_segments(ids))
 
           if layer.with_unique:
             unique_ids, idx = tf.unique(ids_flat)
@@ -306,11 +368,26 @@ def fit_ps(model,
               emb = shadow.read_value(do_prefetch=True)
             unique_info[layer_name] = None
 
-          if hasattr(layer, 'reduce_pooling'):
+          if getattr(layer, 'is_sequence', False):
+            if is_sparse:
+              raise ValueError(
+                  "Sequence feature '{}' requires a pre-padded Dense Tensor, "
+                  "but received SparseTensor/RaggedTensor. Pad your sequence "
+                  "on the data side.".format(layer.input_key))
+            emb = tf.reshape(
+                emb, tf.concat([tf.shape(ids), [layer.embedding_size]], axis=0))
+            emb = tf.ensure_shape(emb, [None, None, layer.embedding_size])
+          elif is_sparse:
+            combiner = getattr(layer, 'combiner', 'sum')
+            emb = _segment_combine(emb, segment_ids, num_segments, combiner)
+            emb = tf.ensure_shape(emb, [None, layer.embedding_size])
+          elif hasattr(layer, 'reduce_pooling'):
             emb_reshaped = tf.reshape(
                 emb, tf.concat([tf.shape(ids), [layer.embedding_size]], axis=0))
             emb = layer.reduce_pooling(emb_reshaped)
-          emb = tf.ensure_shape(emb, [None, layer.embedding_size])
+            emb = tf.ensure_shape(emb, [None, layer.embedding_size])
+          else:
+            emb = tf.ensure_shape(emb, [None, layer.embedding_size])
           embeddings[layer_name] = emb
           shadow_list.append(shadow)
 

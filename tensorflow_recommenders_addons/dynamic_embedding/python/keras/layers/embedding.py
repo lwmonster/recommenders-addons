@@ -145,6 +145,7 @@ class Embedding(Layer):
                with_unique=True,
                short_file_name=False,
                input_key=None,
+               is_sequence=False,
                **kwargs):
     """
     Creates an Embedding layer.
@@ -196,6 +197,7 @@ class Embedding(Layer):
     self.embedding_size = embedding_size
     self.combiner = combiner
     self.input_key = input_key
+    self.is_sequence = is_sequence
     if initializer is None:
       initializer = RandomNormal()
     partitioner = kwargs.get('partitioner', devar.default_partition_fn)
@@ -337,6 +339,8 @@ class Embedding(Layer):
             self.params.kv_creator if self.keep_distribution else None,
         'max_norm':
             _max_norm,
+        'is_sequence':
+            self.is_sequence,
     }
     return config
 
